@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 CASTFILE="./Castfile"
 DRY_RUN=0
 VERBOSE=0
@@ -82,7 +82,7 @@ template_str() {
     _str="$1"
     for _k in $VARS; do
         eval "_v=\${VAR_$_k}"
-        _str=$(echo "$_str" | sed "s%\\$$_k%$_v%g; s%\\${$_k}%$_v%g")
+        _str=$(echo "$_str" | sed 's%\$'"$_k"'%'"$_v"'%g; s%\${'"$_k"'}%'"$_v"'%g')
     done
     printf "%s\n" "$_str"
 }
