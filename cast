@@ -1,14 +1,20 @@
 #!/bin/sh
 set -e
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 CASTFILE="./Castfile"
 DRY_RUN=0
 VERBOSE=0
 HOST_OVERRIDE=""
+TARGET_HOST=""
+PARALLEL=0
+
+# Literal newline for POSIX compliant string building
+NL='
+'
 
 usage() {
-    cat <<EOF
+    cat <<USG
 cast $VERSION - minimal SSH deploy tool
 
 Usage: cast [options] <task>
@@ -16,15 +22,17 @@ Usage: cast [options] <task>
 Options:
   -f <file>    Castfile path (default: ./Castfile)
   -h <host>    Override host (user@host)
+  -t <name>    Target specific host by name (from Castfile)
+  -p           Run on all hosts in parallel
   -n           Dry run (print commands only)
   -v           Verbose output
   --help       Show this help
 
 Examples:
   cast deploy
-  cast -h user@server deploy
-  cast -n status
-EOF
+  cast -p deploy
+  cast -t prod deploy
+USG
     exit 0
 }
 
@@ -39,13 +47,17 @@ err() {
 
 run_ssh() {
     host="$1"
-    shift
-    cmd="$*"
+    cmd="$2"
+    prefix="$3"
     if [ "$DRY_RUN" = "1" ]; then
-        echo "[dry-run] ssh $host '$cmd'"
+        echo "${prefix}[dry-run] ssh $host '$cmd'"
     else
-        log "ssh $host '$cmd'"
-        ssh $SSH_OPTS "$host" "$cmd"
+        log "${prefix}ssh $host '$cmd'"
+        if [ -n "$prefix" ]; then
+            ssh $SSH_OPTS "$host" "$cmd" 2>&1 | sed "s/^/$prefix/"
+        else
+            ssh $SSH_OPTS "$host" "$cmd"
+        fi
     fi
 }
 
@@ -53,12 +65,26 @@ copy_file() {
     host="$1"
     src="$2"
     dst="$3"
+    prefix="$4"
     if [ "$DRY_RUN" = "1" ]; then
-        echo "[dry-run] scp $src $host:$dst"
+        echo "${prefix}[dry-run] scp $src $host:$dst"
     else
-        log "scp $src -> $host:$dst"
-        scp $SSH_OPTS "$src" "$host:$dst"
+        log "${prefix}scp $src -> $host:$dst"
+        if [ -n "$prefix" ]; then
+            scp $SSH_OPTS "$src" "$host:$dst" 2>&1 | sed "s/^/$prefix/"
+        else
+            scp $SSH_OPTS "$src" "$host:$dst"
+        fi
     fi
+}
+
+template_str() {
+    _str="$1"
+    for _k in $VARS; do
+        eval "_v=\${VAR_$_k}"
+        _str=$(echo "$_str" | sed "s%\\$$_k%$_v%g; s%\\${$_k}%$_v%g")
+    done
+    printf "%s\n" "$_str"
 }
 
 parse_castfile() {
@@ -72,6 +98,12 @@ parse_castfile() {
         [ -z "$line" ] && continue
 
         case "$line" in
+            var\ *)
+                key=$(echo "$line" | awk '{print $2}')
+                val=$(echo "$line" | cut -d' ' -f3-)
+                eval "VAR_$key=\"$val\""
+                VARS="$VARS $key"
+                ;;
             host\ *)
                 name=$(echo "$line" | awk '{print $2}')
                 addr=$(echo "$line" | awk '{print $3}')
@@ -88,18 +120,49 @@ parse_castfile() {
             run\ *)
                 if [ -n "$current_task" ]; then
                     cmd=$(echo "$line" | cut -d' ' -f2-)
-                    eval "TASK_${current_task}_CMDS=\"\${TASK_${current_task}_CMDS}run|$cmd\n\""
+                    eval "TASK_${current_task}_CMDS=\"\${TASK_${current_task}_CMDS}run|$cmd\${NL}\""
                 fi
                 ;;
             copy\ *)
                 if [ -n "$current_task" ]; then
                     src=$(echo "$line" | awk '{print $2}')
                     dst=$(echo "$line" | awk '{print $3}')
-                    eval "TASK_${current_task}_CMDS=\"\${TASK_${current_task}_CMDS}copy|$src|$dst\n\""
+                    eval "TASK_${current_task}_CMDS=\"\${TASK_${current_task}_CMDS}copy|$src|$dst\${NL}\""
                 fi
                 ;;
         esac
     done < "$CASTFILE"
+}
+
+execute_host() {
+    host_name="$1"
+    host_addr="$2"
+    cmds="$3"
+    
+    prefix=""
+    [ "$PARALLEL" = "1" ] && prefix="[$host_name] "
+
+    echo "${prefix}==> $host_name ($host_addr)"
+
+    printf "%s\n" "$cmds" | while IFS= read -r cmd_line; do
+        [ -z "$cmd_line" ] && continue
+        cmd_line=$(template_str "$cmd_line")
+        type=$(echo "$cmd_line" | cut -d'|' -f1)
+
+        case "$type" in
+            run)
+                cmd=$(echo "$cmd_line" | cut -d'|' -f2-)
+                echo "${prefix}  + $cmd"
+                run_ssh "$host_addr" "$cmd" "$prefix"
+                ;;
+            copy)
+                src=$(echo "$cmd_line" | cut -d'|' -f2)
+                dst=$(echo "$cmd_line" | cut -d'|' -f3)
+                echo "${prefix}  + copy $src -> $dst"
+                copy_file "$host_addr" "$src" "$dst" "$prefix"
+                ;;
+        esac
+    done
 }
 
 execute_task() {
@@ -109,38 +172,38 @@ execute_task() {
 
     eval "cmds=\"\${TASK_${task}_CMDS}\""
 
-    for host_name in $HOSTS; do
+    if [ -n "$TARGET_HOST" ]; then
+        eval "host_addr=\${HOST_$TARGET_HOST}"
+        [ -z "$host_addr" ] && err "unknown host: $TARGET_HOST"
+        HOST_LIST="$TARGET_HOST"
+    else
+        HOST_LIST="$HOSTS"
+    fi
+
+    for host_name in $HOST_LIST; do
         eval "host_addr=\${HOST_$host_name}"
         [ -n "$HOST_OVERRIDE" ] && host_addr="$HOST_OVERRIDE"
 
-        echo "==> $host_name ($host_addr)"
-
-        echo "$cmds" | while IFS= read -r cmd_line; do
-            [ -z "$cmd_line" ] && continue
-            type=$(echo "$cmd_line" | cut -d'|' -f1)
-
-            case "$type" in
-                run)
-                    cmd=$(echo "$cmd_line" | cut -d'|' -f2-)
-                    echo "  + $cmd"
-                    run_ssh "$host_addr" "$cmd"
-                    ;;
-                copy)
-                    src=$(echo "$cmd_line" | cut -d'|' -f2)
-                    dst=$(echo "$cmd_line" | cut -d'|' -f3)
-                    echo "  + copy $src -> $dst"
-                    copy_file "$host_addr" "$src" "$dst"
-                    ;;
-            esac
-        done
+        if [ "$PARALLEL" = "1" ]; then
+            execute_host "$host_name" "$host_addr" "$cmds" &
+        else
+            execute_host "$host_name" "$host_addr" "$cmds"
+        fi
     done
+
+    if [ "$PARALLEL" = "1" ]; then
+        wait
+        echo "==> parallel execution complete"
+    fi
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         -f) CASTFILE="$2"; shift 2 ;;
         -h) HOST_OVERRIDE="$2"; shift 2 ;;
+        -t) TARGET_HOST="$2"; shift 2 ;;
         -n) DRY_RUN=1; shift ;;
+        -p) PARALLEL=1; shift ;;
         -v) VERBOSE=1; shift ;;
         --help) usage ;;
         -*) err "unknown option: $1" ;;
