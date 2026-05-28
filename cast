@@ -1,0 +1,154 @@
+#!/bin/sh
+set -e
+
+VERSION="0.1.0"
+CASTFILE="./Castfile"
+DRY_RUN=0
+VERBOSE=0
+HOST_OVERRIDE=""
+
+usage() {
+    cat <<EOF
+cast $VERSION - minimal SSH deploy tool
+
+Usage: cast [options] <task>
+
+Options:
+  -f <file>    Castfile path (default: ./Castfile)
+  -h <host>    Override host (user@host)
+  -n           Dry run (print commands only)
+  -v           Verbose output
+  --help       Show this help
+
+Examples:
+  cast deploy
+  cast -h user@server deploy
+  cast -n status
+EOF
+    exit 0
+}
+
+log() {
+    [ "$VERBOSE" = "1" ] && echo "[cast] $*" >&2
+}
+
+err() {
+    echo "[cast] error: $*" >&2
+    exit 1
+}
+
+run_ssh() {
+    host="$1"
+    shift
+    cmd="$*"
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "[dry-run] ssh $host '$cmd'"
+    else
+        log "ssh $host '$cmd'"
+        ssh $SSH_OPTS "$host" "$cmd"
+    fi
+}
+
+copy_file() {
+    host="$1"
+    src="$2"
+    dst="$3"
+    if [ "$DRY_RUN" = "1" ]; then
+        echo "[dry-run] scp $src $host:$dst"
+    else
+        log "scp $src -> $host:$dst"
+        scp $SSH_OPTS "$src" "$host:$dst"
+    fi
+}
+
+parse_castfile() {
+    [ -f "$CASTFILE" ] || err "Castfile not found: $CASTFILE"
+
+    in_task=0
+    current_task=""
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        line=$(echo "$line" | sed 's/#.*$//' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
+        [ -z "$line" ] && continue
+
+        case "$line" in
+            host\ *)
+                name=$(echo "$line" | awk '{print $2}')
+                addr=$(echo "$line" | awk '{print $3}')
+                eval "HOST_$name=\"$addr\""
+                HOSTS="$HOSTS $name"
+                ;;
+            ssh_opts\ *)
+                SSH_OPTS=$(echo "$line" | cut -d' ' -f2-)
+                ;;
+            task\ *)
+                current_task=$(echo "$line" | awk '{print $2}')
+                eval "TASK_$current_task=1"
+                ;;
+            run\ *)
+                if [ -n "$current_task" ]; then
+                    cmd=$(echo "$line" | cut -d' ' -f2-)
+                    eval "TASK_${current_task}_CMDS=\"\${TASK_${current_task}_CMDS}run|$cmd\n\""
+                fi
+                ;;
+            copy\ *)
+                if [ -n "$current_task" ]; then
+                    src=$(echo "$line" | awk '{print $2}')
+                    dst=$(echo "$line" | awk '{print $3}')
+                    eval "TASK_${current_task}_CMDS=\"\${TASK_${current_task}_CMDS}copy|$src|$dst\n\""
+                fi
+                ;;
+        esac
+    done < "$CASTFILE"
+}
+
+execute_task() {
+    task="$1"
+    eval "task_exists=\${TASK_$task}"
+    [ -n "$task_exists" ] || err "unknown task: $task"
+
+    eval "cmds=\"\${TASK_${task}_CMDS}\""
+
+    for host_name in $HOSTS; do
+        eval "host_addr=\${HOST_$host_name}"
+        [ -n "$HOST_OVERRIDE" ] && host_addr="$HOST_OVERRIDE"
+
+        echo "==> $host_name ($host_addr)"
+
+        echo "$cmds" | while IFS= read -r cmd_line; do
+            [ -z "$cmd_line" ] && continue
+            type=$(echo "$cmd_line" | cut -d'|' -f1)
+
+            case "$type" in
+                run)
+                    cmd=$(echo "$cmd_line" | cut -d'|' -f2-)
+                    echo "  + $cmd"
+                    run_ssh "$host_addr" "$cmd"
+                    ;;
+                copy)
+                    src=$(echo "$cmd_line" | cut -d'|' -f2)
+                    dst=$(echo "$cmd_line" | cut -d'|' -f3)
+                    echo "  + copy $src -> $dst"
+                    copy_file "$host_addr" "$src" "$dst"
+                    ;;
+            esac
+        done
+    done
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -f) CASTFILE="$2"; shift 2 ;;
+        -h) HOST_OVERRIDE="$2"; shift 2 ;;
+        -n) DRY_RUN=1; shift ;;
+        -v) VERBOSE=1; shift ;;
+        --help) usage ;;
+        -*) err "unknown option: $1" ;;
+        *) TASK="$1"; shift ;;
+    esac
+done
+
+[ -n "$TASK" ] || usage
+
+parse_castfile
+execute_task "$TASK"

@@ -1,0 +1,14 @@
+host web user@192.168.1.10
+host db user@192.168.1.20
+
+ssh_opts -i ~/.ssh/id_ed25519
+
+task deploy
+  run mkdir -p /opt/app
+  copy ./app /opt/app/app
+  run chmod +x /opt/app/app
+  run systemctl restart app
+
+task status
+  run systemctl status app
+  run journalctl -u app --no-pager -n 20
