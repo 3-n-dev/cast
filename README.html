@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>cast</title>
+</head>
+<body>
+<h1>cast</h1>
+<p>Minimal SSH deploy tool in ~150 lines of POSIX shell.</p>
+
+<h2>Features</h2>
+<ul>
+<li>Single file, zero dependencies</li>
+<li>Declarative <code>Castfile</code> syntax</li>
+<li>Dry-run mode</li>
+<li>Multi-host support</li>
+<li>File copying and remote command execution</li>
+</ul>
+
+<h2>Usage</h2>
+<pre><code>cast [options] &lt;task&gt;
+
+Options:
+  -f &lt;file&gt;    Castfile path (default: ./Castfile)
+  -h &lt;host&gt;    Override host (user@host)
+  -n           Dry run (print commands only)
+  -v           Verbose output
+</code></pre>
+
+<h2>Castfile Example</h2>
+<pre><code>host web user@192.168.1.10
+host db user@192.168.1.20
+
+ssh_opts -i ~/.ssh/id_ed25519
+
+task deploy
+  run mkdir -p /opt/app
+  copy ./app /opt/app/app
+  run chmod +x /opt/app/app
+  run systemctl restart app
+
+task status
+  run systemctl status app
+  run journalctl -u app --no-pager -n 20
+</code></pre>
+
+<h2>Install</h2>
+<pre><code>curl -sL https://3-n.lain.ch/git/cast.git/plain/cast &gt; /usr/local/bin/cast
+chmod +x /usr/local/bin/cast
+</code></pre>
+
+<h2>License</h2>
+<p>MIT</p>
+</body>
+</html>
